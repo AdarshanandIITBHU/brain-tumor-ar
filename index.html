@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>BraTS Brain Tumor — Free-Rotation AR</title>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      font-family: Arial, sans-serif;
+      background: #101820;
+      color: white;
+    }
+
+    #start-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      padding: 24px;
+      text-align: center;
+      background: #101820;
+    }
+
+    #status { color: #74d9a2; min-height: 24px; }
+
+    button {
+      padding: 14px 22px;
+      border: none;
+      border-radius: 25px;
+      background: #1686d9;
+      color: white;
+      font-size: 16px;
+      font-weight: bold;
+    }
+    button:disabled { background: #777; }
+    button.secondary { background: rgba(30, 40, 52, 0.85); }
+
+    /* AR overlay (shown only during the AR session) */
+    #overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      pointer-events: auto;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 16px;
+      box-sizing: border-box;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #hint {
+      align-self: center;
+      padding: 8px 14px;
+      border-radius: 14px;
+      background: rgba(16, 24, 32, 0.7);
+      font-size: 14px;
+      text-align: center;
+      max-width: 90%;
+    }
+
+    #controls {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+      padding-bottom: 12px;
+    }
+
+    #controls button { padding: 12px 18px; font-size: 15px; }
+    small { color: #9fb3c8; max-width: 420px; }
+  </style>
+</head>
+
+<body>
+
+  <div id="start-screen">
+    <h2>3D Brain Tumor — Free-Rotation AR</h2>
+    <p>AI-based brain tumor segmentation and 3D visualization.</p>
+    <div id="status">Checking AR support...</div>
+    <button id="startBtn" disabled>Start AR</button>
+    <small>
+      Needs an Android phone with Chrome and ARCore, over HTTPS.
+      Research visualization only. Not intended for clinical decision-making.
+    </small>
+    <a href="./index.html" style="color:#74b9ff">Back to standard viewer</a>
+  </div>
+
+  <div id="overlay">
+    <div id="hint">Point at a surface, then tap "Place here"</div>
+    <div id="controls">
+      <button id="placeBtn">Place here</button>
+      <button id="moveBtn" class="secondary" style="display:none">Move</button>
+      <button id="resetBtn" class="secondary" style="display:none">Reset rotation</button>
+      <button id="exitBtn" class="secondary">Exit AR</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+    const MODEL_URL = "./brain_tumor_ar.glb";
+    const MODEL_SIZE_METERS = 0.3;   // longest side of the model in AR
+    const FLOAT_HEIGHT = 0.2;        // how far above the surface it floats (meters)
+    const ROTATE_SPEED = 0.008;      // radians per pixel of drag
+    const MIN_SCALE = 0.2, MAX_SCALE = 6;
+    const TUMOR_COLOR = 0xe61919;    // red
+    const SHELL_COLOR = 0xb9c3d2;    // light gray-blue
+    const SHELL_OPACITY = 0.25;      // 0 = invisible, 1 = solid
+
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const startScreen = document.getElementById("start-screen");
+    const overlay = document.getElementById("overlay");
+    const hint = document.getElementById("hint");
+    const placeBtn = document.getElementById("placeBtn");
+    const moveBtn = document.getElementById("moveBtn");
+    const resetBtn = document.getElementById("resetBtn");
+    const exitBtn = document.getElementById("exitBtn");
+
+    // ---------- Three.js setup ----------
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType("local");
+    renderer.domElement.style.cssText = "position:fixed;inset:0;z-index:0;";
+    document.body.appendChild(renderer.domElement);
+
+    // Soft environment lighting (this is what model-viewer does for you by default)
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.4));
+    const dir = new THREE.DirectionalLight(0xffffff, 1.6);
+    dir.position.set(1, 2, 1.5);
+    scene.add(dir);
+
+    // Placement reticle
+    const reticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.12, 0.16, 48).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0x74d9a2, side: THREE.DoubleSide, depthTest: false })
+    );
+    reticle.matrixAutoUpdate = false;
+    reticle.renderOrder = 10;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // pivot = the thing we rotate / scale / move. The model is centered inside it,
+    // so rotation happens around the model's own center on every axis.
+    const pivot = new THREE.Group();
+    pivot.visible = false;
+    scene.add(pivot);
+
+    let modelLoaded = false;
+    new GLTFLoader().load(
+      MODEL_URL,
+      (gltf) => {
+        const model = gltf.scene;
+
+        // The GLB has no materials, only vertex colors (shell = light gray-blue
+        // with ~19% alpha, tumor = opaque red). glTF's default material is fully
+        // metallic, which renders black without an environment, and alpha is
+        // ignored unless transparency is enabled. So we build proper materials.
+        model.traverse((o) => {
+          if (!o.isMesh) return;
+          const isShell = o.name === "translucent_brain";
+
+          // ROOT CAUSE of the black look: this GLB has no normals (only POSITION
+          // and COLOR_0), and lighting needs normals. Compute them.
+          if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+          // Explicit colors per mesh (no reliance on the GLB's vertex colors)
+          o.material = isShell
+            ? new THREE.MeshStandardMaterial({
+                color: SHELL_COLOR,
+                metalness: 0,
+                roughness: 0.5,
+                transparent: true,
+                opacity: SHELL_OPACITY,
+                depthWrite: false,
+                side: THREE.DoubleSide
+              })
+            : new THREE.MeshStandardMaterial({
+                color: TUMOR_COLOR,
+                emissive: TUMOR_COLOR,
+                emissiveIntensity: 0.35, // keeps it clearly red under any lighting
+                metalness: 0,
+                roughness: 0.45,
+                side: THREE.DoubleSide
+              });
+          o.renderOrder = isShell ? 2 : 1; // draw the shell after the tumor inside it
+        });
+
+        // Normalize size, then center on the origin
+        let box = new THREE.Box3().setFromObject(model);
+        const size = box.getSize(new THREE.Vector3());
+        model.scale.setScalar(MODEL_SIZE_METERS / Math.max(size.x, size.y, size.z));
+        box = new THREE.Box3().setFromObject(model);
+        model.position.sub(box.getCenter(new THREE.Vector3()));
+
+        pivot.add(model);
+        modelLoaded = true;
+        checkReady();
+      },
+      (e) => {
+        if (e.total) statusEl.textContent = "Loading brain model: " + Math.round((e.loaded / e.total) * 100) + "%";
+      },
+      (err) => {
+        console.error(err);
+        statusEl.textContent = "ERROR: Model failed to load. Check brain_tumor_ar.glb.";
+      }
+    );
+
+    // ---------- AR support check ----------
+    let arSupported = false;
+    if (navigator.xr) {
+      navigator.xr.isSessionSupported("immersive-ar").then((ok) => {
+        arSupported = ok;
+        if (!ok) statusEl.textContent = "Immersive AR is not supported on this device/browser.";
+        checkReady();
+      });
+    } else {
+      statusEl.textContent = "WebXR not available. Use Chrome on an Android phone with ARCore (HTTPS).";
+    }
+
+    function checkReady() {
+      if (modelLoaded && arSupported) {
+        statusEl.textContent = "Ready.";
+        startBtn.disabled = false;
+      }
+    }
+
+    // ---------- Session handling ----------
+    let hitTestSource = null;
+    let hitTestRequested = false;
+    let hitTestError = null;
+    let placing = true;
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        const session = await navigator.xr.requestSession("immersive-ar", {
+          requiredFeatures: ["hit-test"],
+          optionalFeatures: ["dom-overlay"],
+          domOverlay: { root: overlay }
+        });
+        await renderer.xr.setSession(session);
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = "Could not start AR: " + e.message;
+      }
+    });
+
+    renderer.xr.addEventListener("sessionstart", () => {
+      startScreen.style.display = "none";
+      overlay.style.display = "flex";
+      setPlacing(true);
+    });
+
+    renderer.xr.addEventListener("sessionend", () => {
+      startScreen.style.display = "flex";
+      overlay.style.display = "none";
+      hitTestSource = null;
+      hitTestRequested = false;
+      hitTestError = null;
+      lastHint = "";
+      pivot.visible = false;
+      pivot.quaternion.identity();
+      pivot.scale.setScalar(1);
+      reticle.visible = false;
+    });
+
+    // Stop taps on the overlay from also firing an XR "select"
+    overlay.addEventListener("beforexrselect", (e) => e.preventDefault());
+
+    function setPlacing(value) {
+      placing = value;
+      lastHint = "";
+      placeBtn.style.display = value ? "" : "none";
+      moveBtn.style.display = value ? "none" : "";
+      resetBtn.style.display = value ? "none" : "";
+      hint.textContent = value
+        ? "Starting surface detection..."
+        : "1 finger: rotate any direction · Pinch: scale · Twist: roll";
+      if (!value) reticle.visible = false;
+    }
+
+    placeBtn.addEventListener("click", () => {
+      if (reticle.visible) {
+        // Place on the detected surface
+        pivot.position.setFromMatrixPosition(reticle.matrix);
+        pivot.position.y += FLOAT_HEIGHT;
+      } else {
+        // No surface found yet: place in front of the camera instead
+        const p = new THREE.Vector3();
+        renderer.xr.getCamera().getWorldPosition(p);
+        pivot.position.copy(p).addScaledVector(cameraAxes().forward, 0.8);
+      }
+      pivot.visible = true;
+      setPlacing(false);
+    });
+
+    moveBtn.addEventListener("click", () => setPlacing(true));
+    resetBtn.addEventListener("click", () => {
+      pivot.quaternion.identity();
+      pivot.scale.setScalar(1);
+    });
+    exitBtn.addEventListener("click", () => {
+      const session = renderer.xr.getSession();
+      if (session) session.end();
+    });
+
+    // ---------- Touch gestures: free rotation on all axes ----------
+    const camQuat = new THREE.Quaternion();
+    const qDelta = new THREE.Quaternion();
+    const AXIS_X = new THREE.Vector3(1, 0, 0);
+    const AXIS_Y = new THREE.Vector3(0, 1, 0);
+    const AXIS_FWD = new THREE.Vector3(0, 0, -1);
+
+    let lastX = 0, lastY = 0, lastDist = 0, lastAngle = 0;
+
+    const dist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const angle = (t) => Math.atan2(t[1].clientY - t[0].clientY, t[1].clientX - t[0].clientX);
+
+    function cameraAxes() {
+      renderer.xr.getCamera().getWorldQuaternion(camQuat);
+      return {
+        right: AXIS_X.clone().applyQuaternion(camQuat),
+        up: AXIS_Y.clone().applyQuaternion(camQuat),
+        forward: AXIS_FWD.clone().applyQuaternion(camQuat)
+      };
+    }
+
+    function rotateWorld(axis, radians) {
+      qDelta.setFromAxisAngle(axis, radians);
+      pivot.quaternion.premultiply(qDelta).normalize();
+    }
+
+    overlay.addEventListener("touchstart", (e) => {
+      if (e.target.closest("button")) return;
+      e.preventDefault();
+      const t = e.touches;
+      if (t.length === 1) {
+        lastX = t[0].clientX;
+        lastY = t[0].clientY;
+      } else if (t.length === 2) {
+        lastDist = dist(t);
+        lastAngle = angle(t);
+      }
+    }, { passive: false });
+
+    overlay.addEventListener("touchmove", (e) => {
+      if (e.target.closest("button") || placing || !pivot.visible) return;
+      e.preventDefault();
+      const t = e.touches;
+
+      if (t.length === 1) {
+        const dx = t[0].clientX - lastX;
+        const dy = t[0].clientY - lastY;
+        lastX = t[0].clientX;
+        lastY = t[0].clientY;
+
+        // Drag left/right spins around the screen's vertical axis,
+        // drag up/down tilts around the screen's horizontal axis.
+        const { right, up } = cameraAxes();
+        rotateWorld(up, dx * ROTATE_SPEED);
+        rotateWorld(right, dy * ROTATE_SPEED);
+      } else if (t.length === 2) {
+        const d = dist(t);
+        const a = angle(t);
+
+        // Pinch = scale
+        if (lastDist > 0) {
+          const s = THREE.MathUtils.clamp(pivot.scale.x * (d / lastDist), MIN_SCALE, MAX_SCALE);
+          pivot.scale.setScalar(s);
+        }
+
+        // Twist = roll around the viewing direction
+        let da = a - lastAngle;
+        if (da > Math.PI) da -= 2 * Math.PI;
+        if (da < -Math.PI) da += 2 * Math.PI;
+        rotateWorld(cameraAxes().forward, da);
+
+        lastDist = d;
+        lastAngle = a;
+      }
+    }, { passive: false });
+
+    overlay.addEventListener("touchend", (e) => {
+      const t = e.touches;
+      if (t.length === 1) {
+        // Went from 2 fingers to 1: restart single-finger tracking without a jump
+        lastX = t[0].clientX;
+        lastY = t[0].clientY;
+      }
+    });
+
+    // ---------- Render loop with hit-testing ----------
+    let lastHint = "";
+    function showHint(text) {
+      if (text !== lastHint) {
+        hint.textContent = text;
+        lastHint = text;
+      }
+    }
+
+    renderer.setAnimationLoop((time, frame) => {
+      if (frame) {
+        const session = renderer.xr.getSession();
+
+        if (!hitTestRequested) {
+          hitTestRequested = true;
+          session.requestReferenceSpace("viewer")
+            .then((viewerSpace) => session.requestHitTestSource({ space: viewerSpace }))
+            .then((src) => { hitTestSource = src; })
+            .catch((err) => {
+              console.error("Hit-test setup failed:", err);
+              hitTestError = err.message || String(err);
+            });
+        }
+
+        if (placing) {
+          if (hitTestError) {
+            reticle.visible = false;
+            showHint("Surface detection unavailable (" + hitTestError + "). Tap Place here to place in front of you.");
+          } else if (!hitTestSource) {
+            showHint("Starting surface detection...");
+          } else {
+            const hits = frame.getHitTestResults(hitTestSource);
+            const pose = hits.length ? hits[0].getPose(renderer.xr.getReferenceSpace()) : null;
+            if (pose) {
+              reticle.visible = true;
+              reticle.matrix.fromArray(pose.transform.matrix);
+              showHint('Surface found. Tap "Place here"');
+            } else {
+              reticle.visible = false;
+              showHint('Move your phone slowly to scan the floor or a table. Or tap "Place here" to place it in front of you.');
+            }
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+
+</body>
+</html>
